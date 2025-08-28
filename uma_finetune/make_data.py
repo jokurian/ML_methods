@@ -10,7 +10,6 @@ from ase.calculators.singlepoint import SinglePointCalculator
 
 def parse_extended_xyz(
     filename,
-    error_file="error_arrays.npz",
     add_random_error=False,
     error_value=0.63,
     energy_convert=1.00,
