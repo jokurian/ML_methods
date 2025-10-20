@@ -4,6 +4,14 @@ import numpy as np
 from jax import numpy as jnp
 from jax import jit
 import jax
+from sgdml.train import GDMLTrain
+
+#B : number of training samples
+#T : number of test samples
+#N : number of atoms
+#M : number of descriptor entries = N*(N-1)/2
+#3N: 3*number of atoms (for forces)
+
 
 def parse_extended_xyz(
     filename,
@@ -85,6 +93,14 @@ def _kprime_ksecond(d, sigma):
     ksecond = expterm * (-(a*a/3.0) - (a*a*a/3.0)*d + (a**4/3.0)*d*d)
     return kprime, ksecond  # (B,B) or (T,B)
 
+def assemble_force_kernel(H_xx_all, J):
+    B, M = J.shape[0], J.shape[1]
+    D = J.shape[2]          #3N
+    K_blocks = np.einsum('ami,abmn,bnj->aibj', J, H_xx_all, J)
+    K_full = K_blocks.reshape(B * D, B * D)  #B:ntrain
+    return K_full
+
+
 # Get d desc / dR using autodiff
 from jax import jacfwd, vmap, jit
 
@@ -104,7 +120,7 @@ def train(K_train,lamda,F_train):
     return alpha
 
 def hess_desc_cross_explicit(D_left, D_right, sigma, eps=1e-14):
-    #test left (or test left for training kernel), train right
+    #test left, train right
     D_left  = np.asarray(D_left)
     D_right = np.asarray(D_right)
     T, M = D_left.shape
@@ -199,6 +215,22 @@ def predict_forces_sym(R_test_jnp, D_test, J_test,
     F_pred = F_sum * y_std
     return F_pred
 
+def predict_energy_no_sym(D_test, D_train, J_train, sigma, alphas_explicit, y_std,c):
+    ntest = D_test.shape[0]
+    ntrain = D_train.shape[0]
+    d = D_test[:, None, :] - D_train[None, :, :]  
+    d_norm = np.linalg.norm(d, axis=-1)            
+    kprime, _ = _kprime_ksecond(d_norm, sigma)   
+    u = d / d_norm[:, :, None]                  
+    u[~np.isfinite(u)] = 0.0
+
+    k2 = np.einsum("ut,utd,tdn->utn", kprime, u, J_train)  
+    k2 = k2.reshape(ntest,ntrain*J_train.shape[2])  
+    E_pred = np.einsum("un,n->u", k2, alphas_explicit)  * y_std
+    E_pred += c
+
+    return E_pred
+
 def predict_energy_sym(D_left, R_train_jnp, sig, alphas_explicit, y_std, c, perms):
     ntrain = R_train_jnp.shape[0]
     ntest  = D_left.shape[0]
@@ -226,6 +258,10 @@ def predict_energy_sym(D_left, R_train_jnp, sig, alphas_explicit, y_std, c, perm
     Epred_sym = Epred_sym * y_std + c   
     return Epred_sym 
 
+def get_c_nosym(E_train, D_train, J_train, sig, alphas_explicit, y_std):
+    E_pred_train = predict_energy_no_sym(D_train, D_train, J_train, sig, alphas_explicit, y_std, 0.0)
+    c = np.mean(E_train - E_pred_train)
+    return c
 
 def get_c_sym(E_train, D_train, R_train_jnp, sig, alphas_explicit, y_std, perms):
     E_pred_train = predict_energy_sym(D_train, R_train_jnp, sig, alphas_explicit, y_std, 0.0, perms)
@@ -261,7 +297,7 @@ ntrain = 100
 ntest = 80
 sig = 10
 lam = 1e-10
-sym = False
+sym = True
 #############################################
 # gdml_train = GDMLTrain()
 # train_indx = gdml_train.draw_strat_sample(Es, ntrain)
@@ -295,32 +331,58 @@ J_train = np.asarray(jax.device_get(J_train), dtype=np.float64)
 J_test = jac_desc_batch(R_test_jnp)
 J_test = np.asarray(jax.device_get(J_test), dtype=np.float64)
 
+
+if(not sym):
+    H_xx_all_explicit = hess_desc_cross_explicit(D_train, D_train, sig) #hess_desc_kernel_explicit(d_np, sig)
+    print(H_xx_all_explicit.shape)
+    K_final_explicit = assemble_force_kernel(H_xx_all_explicit, D_d_train)
+    print(K_final_explicit.shape)
+    y = F_train_jnp.flatten()
+    y_std = np.std(y)
+    y = y / y_std
+    alphas_explicit = train(K_final_explicit, lam, -y)  
+
+    H_cross = hess_desc_cross_explicit(D_test, D_train, sig)
+
+    K_blocks = np.einsum('tmi,tbmn,bnj->tibj', J_test, H_cross, J_train)   
+    K_fF = K_blocks.reshape(D_test.shape[0], J_test.shape[2], -1)  
+    F_pred = np.einsum('tij,j->ti', K_fF, alphas_explicit) * y_std
+
+    rmse = np.sqrt(np.mean((F_pred - F_test)**2))
+    mae = np.mean(np.abs(F_pred - F_test))
+    print("Force MAE (explicit):  ", mae)
+    print("Force RMSE (explicit): ", rmse)
+
+    c = get_c_nosym(E_train, D_train, J_train, sig, alphas_explicit, y_std)
+    E_pred = predict_energy_no_sym(D_test, D_train, J_train, sig, alphas_explicit, y_std, c)
+    rmse_e = np.sqrt(np.mean((E_pred - E_test)**2))
+    mae_e = np.mean(np.abs(E_pred - E_test))
+    print("Energy MAE (explicit):  ", mae_e)
+    print("Energy RMSE (explicit): ", rmse_e)
+
 if(sym):
     perms = np.array([[0, 1, 2, 3, 4, 5],
-    [0, 1, 3, 2, 4, 5]])
-else: perms = np.array([[0, 1, 2, 3, 4, 5]])
+       [0, 1, 3, 2, 4, 5]])
+    # perms = perms[0:1]  #Doing this is equivalent to no symmetrization
+    K_sym = assemble_force_kernel_sym_train(R_train_jnp, D_train, J_train, sig, perms)
+    print(K_sym.shape)
+    y = F_train_jnp.flatten()
+    y_std = np.std(y)
+    y = y / y_std
+    alphas_explicit = train(K_sym, lam, -y)
+    
+    F_pred_sym = predict_forces_sym(R_test_jnp, D_test, J_test,
+                                 R_train_jnp, sig, alphas_explicit,
+                                 y_std, perms)
+    
+    rmse_sym = np.sqrt(np.mean((F_pred_sym - F_test)**2))
+    mae_sym = np.mean(np.abs(F_pred_sym - F_test))
+    print("Force MAE (sym explicit):  ", mae_sym)
+    print("Force RMSE (sym explicit): ", rmse_sym)
 
-
-K_sym = assemble_force_kernel_sym_train(R_train_jnp, D_train, J_train, sig, perms)
-y = F_train_jnp.flatten()
-y_std = np.std(y)
-y = y / y_std
-alphas_explicit = train(K_sym, lam, -y)
-
-F_pred_sym = predict_forces_sym(R_test_jnp, D_test, J_test,
-                                R_train_jnp, sig, alphas_explicit,
-                                y_std, perms)
-
-rmse_sym = np.sqrt(np.mean((F_pred_sym - F_test)**2))
-mae_sym = np.mean(np.abs(F_pred_sym - F_test))
-print("Force MAE (sym explicit):  ", mae_sym)
-print("Force RMSE (sym explicit): ", rmse_sym)
-
-c = get_c_sym(E_train, D_train, R_train_jnp, sig, alphas_explicit, y_std, perms)
-Epred_sym = predict_energy_sym(D_test, R_train_jnp, sig, alphas_explicit, y_std, c, perms)
-rmse_e = np.sqrt(np.mean((Epred_sym - E_test)**2))
-mae_e = np.mean(np.abs(Epred_sym - E_test))
-print("Energy MAE (sym explicit):  ", mae_e)
-print("Energy RMSE (sym explicit): ", rmse_e)
-
-
+    c = get_c_sym(E_train, D_train, R_train_jnp, sig, alphas_explicit, y_std, perms)
+    Epred_sym = predict_energy_sym(D_test, R_train_jnp, sig, alphas_explicit, y_std, c, perms)
+    rmse_e = np.sqrt(np.mean((Epred_sym - E_test)**2))
+    mae_e = np.mean(np.abs(Epred_sym - E_test))
+    print("Energy MAE (sym explicit):  ", mae_e)
+    print("Energy RMSE (sym explicit): ", rmse_e)
