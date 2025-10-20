@@ -254,14 +254,14 @@ natoms = len(species)
 ndim = natoms * 3
 ndata = len(Es)
 
-#############################################
+############# INPUTS ########################
 seed = 52
 np.random.seed(seed)
 ntrain = 100
 ntest = 80
 sig = 10
 lam = 1e-10
-sym = False
+sym = True   #Symmetry permutations
 #############################################
 # gdml_train = GDMLTrain()
 # train_indx = gdml_train.draw_strat_sample(Es, ntrain)
@@ -322,5 +322,194 @@ rmse_e = np.sqrt(np.mean((Epred_sym - E_test)**2))
 mae_e = np.mean(np.abs(Epred_sym - E_test))
 print("Energy MAE (sym explicit):  ", mae_e)
 print("Energy RMSE (sym explicit): ", rmse_e)
+
+
+import os
+import sys
+import numpy as np
+from ase import Atoms
+from sgdml.train import GDMLTrain
+from typing import List
+from ase.calculators.calculator import Calculator, all_properties
+from sgdml.intf.ase_calc import SGDMLCalculator
+from pyscf import gto
+from ase.calculators.singlepoint import SinglePointCalculator
+
+seed = 52
+np.random.seed(seed)
+
+
+def atomic_number_to_symbol(atomic_numbers):
+    """
+    Converts a list of atomic numbers to atomic symbols for elements up to atomic number 20.
+    If an atomic number is greater than 20, an error message is printed.
+
+    Args:
+    atomic_numbers (list): List of atomic numbers (integers).
+
+    Returns:
+    list: List of atomic symbols corresponding to the atomic numbers.
+    """
+    atomic_symbols = {
+        1: 'H',  2: 'He',  3: 'Li',  4: 'Be',  5: 'B',  6: 'C',  7: 'N',  8: 'O',  9: 'F', 10: 'Ne',
+       11: 'Na', 12: 'Mg', 13: 'Al', 14: 'Si', 15: 'P', 16: 'S', 17: 'Cl', 18: 'Ar', 19: 'K', 20: 'Ca'
+    }
+
+    symbols = []
+    for number in atomic_numbers:
+        if number in atomic_symbols:
+            symbols.append(atomic_symbols[number])
+        else:
+            raise ValueError(f"Error: Atomic number {number} is not supported (only up to 20).")
+
+    return symbols
+
+def write_extended_xyz_data(filename, energies, xyz_coords, forces, atom_symbols):
+    """
+    Writes an extended XYZ file with energies, atomic coordinates, and forces.
+
+    Args:
+    filename (str): Output filename for the extended XYZ file.
+    energies (list): List of total energies for each configuration (length = number of configurations).
+    xyz_coords (list of lists): List of atomic coordinates for each configuration.
+                               Each element is a list of lists (one list per atom: [[x, y, z], ...]).
+    forces (list of lists): List of atomic forces for each configuration.
+                            Each element is a list of lists (one list per atom: [[fx, fy, fz], ...]).
+    atom_symbols (list): List of atomic symbols for each atom (e.g., ['H', 'O', 'O']).
+    """
+
+    with open(filename, 'w') as f:
+        for i, energy in enumerate(energies):
+            num_atoms = len(xyz_coords[i])
+            f.write(f"{num_atoms}\n")
+            f.write(f"{energy}\n")
+            for j in range(num_atoms):
+                atom = atom_symbols[j]
+                x, y, z = xyz_coords[i][j]
+                fx, fy, fz = forces[i][j]
+                f.write(f"{atom} {x:.6f} {y:.6f} {z:.6f} {fx:.6f} {fy:.6f} {fz:.6f}\n")
+
+def convert_to_ase_atoms(structures: List[dict]) -> List[Atoms]:
+    """
+    Convert a list of dictionaries into ASE Atoms objects.
+
+    Args:
+        structures (List[dict]): List of dictionaries with keys 'energy', 'species', 'positions', 'forces'.
+
+    Returns:
+        List[Atoms]: List of ASE Atoms objects.
+    """
+    atoms_list = []
+    for s in structures:
+        atoms = Atoms(symbols=s["species"], positions=s["positions"])
+        if "forces" in s and s["forces"] is not None:
+            atoms.set_array("forces", s["forces"])
+        if "energy" in s and s["energy"] is not None:
+            atoms.info["energy"] = s["energy"]
+        calc = SinglePointCalculator(atoms, energy=s["energy"], forces=s["forces"])
+        atoms.calc = calc
+        atoms_list.append(atoms)
+
+    return atoms_list
+
+base_path = "./"
+
+
+os.system(f"rm -rf {base_path}/structures {base_path}/models *.npz")  #Removes old files
+os.system(f"mkdir {base_path}/structures {base_path}/models")
+
+# ntrain = 100
+# sig = 10
+# lam = 1e-10
+# ntest = 100 #ndata - ntrain
+
+higher_data_file = f"md_traj_new.xyz"  # Assumes units kcal/mol and kcal/mol/A for energy and forces
+
+os.system(f"rm -rf {base_path}/structures {base_path}/models/*.npz")  #Removes old files
+# Converts data to sgdml type. Make sure data is in the correct unit, otherwise we will have to change the calculator accordingly
+os.system(f"python {base_path}/sgdml_from_xyz.py {base_path}/{higher_data_file} --r_unit Ang --e_unit kcal/mol")
+
+dataset = np.load(f'{base_path}/{higher_data_file[:-4]}.npz', allow_pickle=True)
+ndata = dataset["E"].shape[0]
+
+train_indx = np.random.choice(ndata, ntrain, replace=False)
+test_indx = np.random.choice(list(set(range(ndata)) - set(train_indx)), ntest, replace=False)
+
+write_extended_xyz_data(f'{base_path}/train_{ntrain}.xyz', dataset['E'][train_indx], dataset['R'][train_indx],
+            dataset['F'][train_indx], atomic_number_to_symbol(dataset['z']))
+
+os.system(f"python {base_path}/sgdml_from_xyz.py {base_path}/train_{ntrain}.xyz --r_unit Ang --e_unit kcal/mol")
+
+write_extended_xyz_data(f'{base_path}/test_{ntest}.xyz', dataset['E'][test_indx], dataset['R'][test_indx],
+            dataset['F'][test_indx], atomic_number_to_symbol(dataset['z']))
+
+os.system(f"python {base_path}/sgdml_from_xyz.py {base_path}/test_{ntest}.xyz --r_unit Ang --e_unit kcal/mol")
+
+
+
+#---------------- Training model ---------------#
+#np.random.seed(seed)
+
+dataset= np.load(f'{base_path}/train_{ntrain}.npz') #np.load(f'{base_path}/{higher_data_file[:-4]}.npz')
+nvalid = 0
+model_path = f"{base_path}/models/model_{ntrain}_{sig}_{lam}_{ntrain}.npz"  #Saves this to disk
+gdml_train = GDMLTrain()
+task = gdml_train.create_task(dataset, ntrain-nvalid,\
+        valid_dataset=dataset, n_valid=nvalid,\
+        sig=sig, lam=lam,use_sym=sym,use_E_cstr=False)
+
+try:
+        model = gdml_train.train(task)
+except Exception:
+        sys.exit()
+else:
+        np.savez_compressed(model_path, **model)
+
+# del gdml_train
+
+#------------------------------------------------#
+
+#----------------- Predict energies ----------------#
+structures = parse_extended_xyz(f"{base_path}/test_{ntest}.xyz", add_random_error=False)
+ase_atoms = convert_to_ase_atoms(structures)
+model_path = f"{base_path}/models/model_{ntrain}_{sig}_{lam}_{ntrain}.npz"
+
+Eexact = []
+Epred = []
+Fpred = []
+Fexact = []
+for i, atoms in enumerate(ase_atoms):
+    E_fromfile = atoms.info["energy"]
+    F_fromfile = atoms.get_array("forces")
+    Eexact.append(E_fromfile)
+    Fexact.append(F_fromfile)
+    atoms.info.update({"spin":1,"charge":0})
+    atoms.calc = SGDMLCalculator(model_path) 
+    energy = atoms.get_potential_energy()[0]*23.06054195
+    forces = atoms.get_forces()*23.06054195
+    Epred.append(energy)
+    Fpred.append(forces)
+    if(i%10==0): print(i)
+
+# print("Eexact:", Eexact)
+# print("Epred:", Epred)
+# print("Diff:", np.array(Epred) - np.array(Eexact))
+
+Fpred = np.array(Fpred).reshape(ntest,-1)
+Fexact = np.array(Fexact).reshape(ntest,-1)
+rmse = np.sqrt(np.mean((Fpred - Fexact)**2))
+mae = np.mean(np.abs(Fpred - Fexact))
+print("SGDML results:")
+print("MAE (force) on test set: ", mae, " [kcal/mol/Ang]")
+print("RMSE (force) on test set: ", rmse, " [kcal/mol/Ang]")
+
+rmse_e = np.sqrt(np.mean((np.array(Epred) - np.array(Eexact))**2))
+mae_e = np.mean(np.abs(np.array(Epred) - np.array(Eexact)))
+print("MAE (energy) on test set: ", mae_e, " [kcal/mol]")
+print("RMSE (energy) on test set: ", rmse_e, " [kcal/mol]")
+
+
+
+
 
 
